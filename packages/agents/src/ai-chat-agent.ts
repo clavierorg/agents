@@ -194,19 +194,6 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     }
   }
 
-  private async _drainStream(stream: ReadableStream<Uint8Array>) {
-    const reader = stream.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        decoder.decode(value);
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
   /**
    * Handle incoming chat messages and generate a response
    * @param onFinish Callback to be called when the response is finished
@@ -237,10 +224,13 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       });
       await this.persistMessages(finalMessages, []);
     });
-    if (response?.body) {
+    if (response) {
       // we're just going to drain the body
-      await this._drainStream(response.body!);
-      response.body.cancel();
+      // @ts-ignore TODO: fix this type error
+      for await (const chunk of response.body!) {
+        decoder.decode(chunk);
+      }
+      response.body?.cancel();
     }
   }
 
@@ -267,9 +257,16 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
   private async _reply(id: string, response: Response) {
     // now take chunks out from dataStreamResponse and send them to the client
     return this._tryCatchChat(async () => {
-      if (response.body) {
-        await this._drainStream(response.body);
-        response.body.cancel();
+      // @ts-expect-error TODO: fix this type error
+      for await (const chunk of response.body!) {
+        const body = decoder.decode(chunk);
+
+        this._broadcastChatMessage({
+          body,
+          done: false,
+          id,
+          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+        });
       }
 
       this._broadcastChatMessage({
