@@ -70,7 +70,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
         } = data.init;
         const { messages: incomingMessages } = JSON.parse(body as string);
 
-        const messages = [...this.messages, ...incomingMessages];
+        const messages = this.getMergedMessages(incomingMessages);
 
         this._broadcastChatMessage(
           {
@@ -171,6 +171,15 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     );
   }
 
+  private getMergedMessages(incomingMessages: ChatMessage[]): ChatMessage[] {
+    return this.messages.map((existing) => {
+      return (
+        incomingMessages.find((incoming) => existing.id === incoming.id) ??
+        existing
+      );
+    });
+  }
+
   override async onRequest(request: Request): Promise<Response> {
     return this._tryCatchChat(() => {
       const url = new URL(request.url);
@@ -213,7 +222,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
    */
   async saveMessages(incomingMessages: ChatMessage[]) {
     await this.persistMessages(incomingMessages);
-    const messages = [...this.messages, ...incomingMessages];
+    const messages = this.getMergedMessages(incomingMessages);
     const response = await this.onChatMessage(async ({ response }) => {
       const finalMessages = appendResponseMessages({
         messages,
