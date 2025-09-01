@@ -35,11 +35,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       message text not null,
       created_at datetime default current_timestamp
     )`;
-    this.messages = (
-      this.sql`select * from cf_ai_chat_agent_messages` || []
-    ).map((row) => {
-      return JSON.parse(row.message as string);
-    });
+    this.messages = this.getMessages();
 
     this._chatMessageAbortControllers = new Map();
   }
