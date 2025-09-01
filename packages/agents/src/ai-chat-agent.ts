@@ -213,9 +213,10 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
    */
   async saveMessages(incomingMessages: ChatMessage[]) {
     await this.persistMessages(incomingMessages);
+    const messages = [...this.messages, ...incomingMessages];
     const response = await this.onChatMessage(async ({ response }) => {
       const finalMessages = appendResponseMessages({
-        messages: incomingMessages,
+        messages,
         responseMessages: response.messages
       });
       await this.persistMessages(finalMessages, []);
