@@ -35,7 +35,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       message text not null,
       created_at datetime default current_timestamp
     )`;
-    this.messages = this.getMessages();
+    this.messages = this.getPersistedMessages();
 
     this._chatMessageAbortControllers = new Map();
   }
@@ -163,7 +163,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     }
   }
 
-  private getMessages(): ChatMessage[] {
+  private getPersistedMessages(): ChatMessage[] {
     return (this.sql`select * from cf_ai_chat_agent_messages` || []).map(
       (row) => {
         return JSON.parse(row.message as string);
@@ -175,7 +175,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     return this._tryCatchChat(() => {
       const url = new URL(request.url);
       if (url.pathname.endsWith("/get-messages")) {
-        const messages = this.getMessages();
+        const messages = this.getPersistedMessages();
         return Response.json(messages);
       }
       return super.onRequest(request);
