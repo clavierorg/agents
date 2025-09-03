@@ -33,7 +33,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     this.sql`create table if not exists cf_ai_chat_agent_messages (
       id text primary key,
       message text not null,
-      created_at datetime default current_timestamp
+      created_at datetime not null
     )`;
     this.messages = this.getPersistedMessages();
 
@@ -164,11 +164,13 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
   }
 
   private getPersistedMessages(): ChatMessage[] {
-    return (this.sql`select * from cf_ai_chat_agent_messages` || []).map(
-      (row) => {
-        return JSON.parse(row.message as string);
-      }
-    );
+    return (
+      this
+        .sql`select * from cf_ai_chat_agent_messages order by created_at asc` ||
+      []
+    ).map((row) => {
+      return JSON.parse(row.message as string);
+    });
   }
 
   private getMergedMessages(_incomingMessages: ChatMessage[]): ChatMessage[] {
@@ -249,11 +251,12 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     incomingMessages: ChatMessage[],
     excludeBroadcastIds: string[] = []
   ) {
-    for (const message of incomingMessages) {
+    for (const msg of incomingMessages) {
+      const id = msg.id;
+      const message = JSON.stringify(msg);
+      const created_at = new Date(msg.createdAt ?? Date.now()).toISOString();
       this
-        .sql`insert or replace into cf_ai_chat_agent_messages (id, message) values (${
-        message.id
-      },${JSON.stringify(message)})`;
+        .sql`insert or replace into cf_ai_chat_agent_messages (id, message, created_at) values (${id},${message},${created_at})`;
     }
     this.messages.push(...incomingMessages);
     this._broadcastChatMessage(
