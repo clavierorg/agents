@@ -171,13 +171,18 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     );
   }
 
-  private getMergedMessages(incomingMessages: ChatMessage[]): ChatMessage[] {
-    return this.messages.map((existing) => {
-      return (
-        incomingMessages.find((incoming) => existing.id === incoming.id) ??
-        existing
-      );
-    });
+  private getMergedMessages(_incomingMessages: ChatMessage[]): ChatMessage[] {
+    const incomingMessages = _incomingMessages.slice();
+    return this.messages
+      .map((existing) => {
+        return (
+          findAndTake(
+            incomingMessages,
+            (incoming) => existing.id === incoming.id
+          ) ?? existing
+        );
+      })
+      .concat(incomingMessages);
   }
 
   override async onRequest(request: Request): Promise<Response> {
@@ -337,4 +342,15 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     this._destroyAbortControllers();
     await super.destroy();
   }
+}
+
+function findAndTake<T>(
+  array: T[],
+  predicate: (item: T) => boolean
+): T | undefined {
+  const index = array.findIndex(predicate);
+  if (index === -1) {
+    return undefined;
+  }
+  return array.splice(index, 1)[0];
 }
