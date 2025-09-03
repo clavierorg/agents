@@ -258,7 +258,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       this
         .sql`insert or replace into cf_ai_chat_agent_messages (id, message, created_at) values (${id},${message},${created_at})`;
     }
-    this.messages.push(...incomingMessages);
+    this.messages = this.getMergedMessages(incomingMessages);
     this._broadcastChatMessage(
       {
         messages: this.messages,
