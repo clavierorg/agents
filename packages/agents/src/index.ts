@@ -1368,7 +1368,7 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
    * Get all methods marked as callable on this Agent
    * @returns A map of method names to their metadata
    */
-  private _isCallable(method: string): boolean {
+  protected _isCallable(method: string): boolean {
     return callableMetadata.has(this[method as keyof this] as Function);
   }
 
