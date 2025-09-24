@@ -236,7 +236,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       const message = JSON.stringify(msg);
       const created_at = new Date(Date.now()).toISOString();
       this
-        .sql`insert or replace into cf_ai_chat_agent_messages (id, message, created_at) values (${id},${message},${created_at})`;
+        .sql`insert into cf_ai_chat_agent_messages (id, message, created_at) values (${id},${message},${created_at}) on conflict(id) do update set message = excluded.message`;
     }
     this.messages = this.getMergedMessages(incomingMessages);
     this._broadcastChatMessage(
