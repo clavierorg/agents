@@ -234,7 +234,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     for (const msg of incomingMessages) {
       const id = msg.id;
       const message = JSON.stringify(msg);
-      const created_at = new Date(msg.createdAt ?? Date.now()).toISOString();
+      const created_at = new Date(Date.now()).toISOString();
       this
         .sql`insert or replace into cf_ai_chat_agent_messages (id, message, created_at) values (${id},${message},${created_at})`;
     }
