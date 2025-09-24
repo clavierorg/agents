@@ -69,15 +69,6 @@ type UseAgentChatOptions<
   autoSendAfterAllConfirmationsResolved?: boolean;
 };
 
-export const prepareRequestBody: UseAgentChatOptions<any>["experimental_prepareRequestBody"] =
-  (body) => {
-    // we only send the new message because previous messages have already been persisted to the Agent
-    return {
-      ...body,
-      messages: body?.messages?.length ? [body.messages.at(-1)] : []
-    };
-  };
-
 const requestCache = new Map<string, Promise<Message[]>>();
 
 /**
