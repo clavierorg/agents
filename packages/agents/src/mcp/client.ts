@@ -1,8 +1,8 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
-  CallToolRequest,
   CallToolResultSchema,
+  CallToolRequest,
   CompatibilityCallToolResultSchema,
   GetPromptRequest,
   Prompt,
@@ -24,6 +24,7 @@ import {
 export class MCPClientManager {
   public mcpConnections: Record<string, MCPClientConnection> = {};
   private _callbackUrls: string[] = [];
+  private _didWarnAboutUnstableGetAITools = false;
 
   /**
    * @param _name Name of the MCP client
@@ -76,17 +77,20 @@ export class MCPClientManager {
       }
     }
 
-    this.mcpConnections[id] = new MCPClientConnection(
-      new URL(url),
-      {
-        name: this._name,
-        version: this._version
-      },
-      {
-        client: options.client ?? {},
-        transport: options.transport ?? {}
-      }
-    );
+    // During OAuth reconnect, reuse existing connection to preserve state
+    if (!options.reconnect?.oauthCode || !this.mcpConnections[id]) {
+      this.mcpConnections[id] = new MCPClientConnection(
+        new URL(url),
+        {
+          name: this._name,
+          version: this._version
+        },
+        {
+          client: options.client ?? {},
+          transport: options.transport ?? {}
+        }
+      );
+    }
 
     await this.mcpConnections[id].init(options.reconnect?.oauthCode);
 
@@ -176,6 +180,27 @@ export class MCPClientManager {
   }
 
   /**
+   * Register a callback URL for OAuth handling
+   * @param url The callback URL to register
+   */
+  registerCallbackUrl(url: string): void {
+    if (!this._callbackUrls.includes(url)) {
+      this._callbackUrls.push(url);
+    }
+  }
+
+  /**
+   * Unregister a callback URL
+   * @param serverId The server ID whose callback URL should be removed
+   */
+  unregisterCallbackUrl(serverId: string): void {
+    // Remove callback URLs that end with this serverId
+    this._callbackUrls = this._callbackUrls.filter(
+      (url) => !url.endsWith(`/${serverId}`)
+    );
+  }
+
+  /**
    * @returns namespaced list of tools
    */
   listTools(): NamespacedData["tools"] {
@@ -185,7 +210,7 @@ export class MCPClientManager {
   /**
    * @returns a set of tools that you can use with the AI SDK
    */
-  unstable_getAITools(): ToolSet {
+  getAITools(): ToolSet {
     return Object.fromEntries(
       getNamespacedData(this.mcpConnections, "tools").map((tool) => {
         return [
@@ -204,11 +229,28 @@ export class MCPClientManager {
               }
               return result;
             },
-            parameters: jsonSchema(tool.inputSchema)
+            inputSchema: jsonSchema(tool.inputSchema),
+            outputSchema: tool.outputSchema
+              ? jsonSchema(tool.outputSchema)
+              : undefined
           }
         ];
       })
     );
+  }
+
+  /**
+   * @deprecated this has been renamed to getAITools(), and unstable_getAITools will be removed in the next major version
+   * @returns a set of tools that you can use with the AI SDK
+   */
+  unstable_getAITools(): ToolSet {
+    if (!this._didWarnAboutUnstableGetAITools) {
+      this._didWarnAboutUnstableGetAITools = true;
+      console.warn(
+        "unstable_getAITools is deprecated, use getAITools instead. unstable_getAITools will be removed in the next major version."
+      );
+    }
+    return this.getAITools();
   }
 
   /**
@@ -258,7 +300,7 @@ export class MCPClientManager {
   /**
    * Namespaced version of callTool
    */
-  callTool(
+  async callTool(
     params: CallToolRequest["params"] & { serverId: string },
     resultSchema?:
       | typeof CallToolResultSchema

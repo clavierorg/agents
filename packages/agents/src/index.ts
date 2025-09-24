@@ -23,8 +23,8 @@ import {
 } from "partyserver";
 import { camelCaseToKebabCase } from "./client";
 import { MCPClientManager } from "./mcp/client";
-// import type { MCPClientConnection } from "./mcp/client-connection";
 import { DurableObjectOAuthClientProvider } from "./mcp/do-oauth-client-provider";
+import type { TransportType } from "./mcp/types";
 import { genericObservability, type Observability } from "./observability";
 import { MessageType } from "./ai-types";
 
@@ -118,7 +118,7 @@ const callableMetadata = new Map<Function, CallableMetadata>();
  * Decorator that marks a method as callable by clients
  * @param metadata Optional metadata about the callable method
  */
-export function unstable_callable(metadata: CallableMetadata = {}) {
+export function callable(metadata: CallableMetadata = {}) {
   return function callableDecorator<This, Args extends unknown[], Return>(
     target: (this: This, ...args: Args) => Return,
     // biome-ignore lint/correctness/noUnusedFunctionParameters: later
@@ -131,6 +131,23 @@ export function unstable_callable(metadata: CallableMetadata = {}) {
     return target;
   };
 }
+
+let didWarnAboutUnstableCallable = false;
+
+/**
+ * Decorator that marks a method as callable by clients
+ * @deprecated this has been renamed to callable, and unstable_callable will be removed in the next major version
+ * @param metadata Optional metadata about the callable method
+ */
+export const unstable_callable = (metadata: CallableMetadata = {}) => {
+  if (!didWarnAboutUnstableCallable) {
+    didWarnAboutUnstableCallable = true;
+    console.warn(
+      "unstable_callable is deprecated, use callable instead. unstable_callable will be removed in the next major version."
+    );
+  }
+  callable(metadata);
+};
 
 export type QueueItem<T = string> = {
   id: string;
@@ -179,6 +196,8 @@ function getNextCronTime(cron: string) {
   const interval = parseCronExpression(cron);
   return interval.getNextDate();
 }
+
+export type { TransportType } from "./mcp/types";
 
 /**
  * MCP Server state update message from server -> Client
@@ -273,7 +292,13 @@ function withAgentContext<T extends (...args: any[]) => any>(
   method: T
 ): (this: Agent<unknown, unknown>, ...args: Parameters<T>) => ReturnType<T> {
   return function (...args: Parameters<T>): ReturnType<T> {
-    const { connection, request, email } = getCurrentAgent();
+    const { connection, request, email, agent } = getCurrentAgent();
+
+    if (agent === this) {
+      // already wrapped, so we can just call the method
+      return method.apply(this, args);
+    }
+    // not wrapped, so we need to wrap it
     return agentContext.run({ agent: this, connection, request, email }, () => {
       return method.apply(this, args);
     });
@@ -285,13 +310,20 @@ function withAgentContext<T extends (...args: any[]) => any>(
  * @template Env Environment type containing bindings
  * @template State State type to store within the Agent
  */
-export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
+export class Agent<
+  Env = typeof env,
+  State = unknown,
+  Props extends Record<string, unknown> = Record<string, unknown>
+> extends Server<Env, Props> {
   private _state = DEFAULT_STATE as State;
 
   private _ParentClass: typeof Agent<Env, State> =
     Object.getPrototypeOf(this).constructor;
 
-  mcp: MCPClientManager = new MCPClientManager(this._ParentClass.name, "0.0.1");
+  readonly mcp: MCPClientManager = new MCPClientManager(
+    this._ParentClass.name,
+    "0.0.1"
+  );
 
   /**
    * Initial state for the Agent
@@ -384,8 +416,11 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
 
-    // Auto-wrap custom methods with agent context
-    this._autoWrapCustomMethods();
+    if (!wrappedClasses.has(this.constructor)) {
+      // Auto-wrap custom methods with agent context
+      this._autoWrapCustomMethods();
+      wrappedClasses.add(this.constructor);
+    }
 
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_state (
@@ -560,44 +595,42 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
       // must fix this
       return agentContext.run(
         { agent: this, connection, request: ctx.request, email: undefined },
-        async () => {
-          setTimeout(() => {
-            if (this.state) {
-              connection.send(
-                JSON.stringify({
-                  state: this.state,
-                  type: MessageType.CF_AGENT_STATE
-                })
-              );
-            }
-
+        () => {
+          if (this.state) {
             connection.send(
               JSON.stringify({
-                mcp: this.getMcpServers(),
-                type: MessageType.CF_AGENT_MCP_SERVERS
+                state: this.state,
+                type: MessageType.CF_AGENT_STATE
               })
             );
+          }
 
-            this.observability?.emit(
-              {
-                displayMessage: "Connection established",
-                id: nanoid(),
-                payload: {
-                  connectionId: connection.id
-                },
-                timestamp: Date.now(),
-                type: "connect"
+          connection.send(
+            JSON.stringify({
+              mcp: this.getMcpServers(),
+              type: MessageType.CF_AGENT_MCP_SERVERS
+            })
+          );
+
+          this.observability?.emit(
+            {
+              displayMessage: "Connection established",
+              id: nanoid(),
+              payload: {
+                connectionId: connection.id
               },
-              this.ctx
-            );
-            return this._tryCatch(() => _onConnect(connection, ctx));
-          }, 20);
+              timestamp: Date.now(),
+              type: "connect"
+            },
+            this.ctx
+          );
+          return this._tryCatch(() => _onConnect(connection, ctx));
         }
       );
     };
 
     const _onStart = this.onStart.bind(this);
-    this.onStart = async () => {
+    this.onStart = async (props?: Props) => {
       return agentContext.run(
         {
           agent: this,
@@ -620,6 +653,13 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
 
             // from DO storage, reconnect to all servers not currently in the oauth flow using our saved auth information
             if (servers && Array.isArray(servers) && servers.length > 0) {
+              // Restore callback URLs for OAuth-enabled servers
+              servers.forEach((server) => {
+                if (server.callback_url) {
+                  this.mcp.registerCallbackUrl(server.callback_url);
+                }
+              });
+
               servers.forEach((server) => {
                 this._connectToMcpServerInternal(
                   server.name,
@@ -657,7 +697,7 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
                   });
               });
             }
-            return _onStart();
+            return _onStart(props);
           });
         }
       );
@@ -833,41 +873,37 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
     while (proto && proto !== Object.prototype && depth < 10) {
       const methodNames = Object.getOwnPropertyNames(proto);
       for (const methodName of methodNames) {
-        // Skip if it's a private method or not a function
+        const descriptor = Object.getOwnPropertyDescriptor(proto, methodName);
+
+        // Skip if it's a private method, a base method, a getter, or not a function,
         if (
           baseMethods.has(methodName) ||
           methodName.startsWith("_") ||
-          typeof this[methodName as keyof this] !== "function"
+          !descriptor ||
+          !!descriptor.get ||
+          typeof descriptor.value !== "function"
         ) {
           continue;
         }
-        // If the method doesn't exist in base prototypes, it's a custom method
-        if (!baseMethods.has(methodName)) {
-          const descriptor = Object.getOwnPropertyDescriptor(proto, methodName);
-          if (descriptor && typeof descriptor.value === "function") {
-            // Wrap the custom method with context
 
-            const wrappedFunction = withAgentContext(
-              // biome-ignore lint/suspicious/noExplicitAny: I can't typescript
-              this[methodName as keyof this] as (...args: any[]) => any
-              // biome-ignore lint/suspicious/noExplicitAny: I can't typescript
-            ) as any;
+        // Now, methodName is confirmed to be a custom method/function
+        // Wrap the custom method with context
+        const wrappedFunction = withAgentContext(
+          // biome-ignore lint/suspicious/noExplicitAny: I can't typescript
+          this[methodName as keyof this] as (...args: any[]) => any
+          // biome-ignore lint/suspicious/noExplicitAny: I can't typescript
+        ) as any;
 
-            // if the method is callable, copy the metadata from the original method
-            if (this._isCallable(methodName)) {
-              callableMetadata.set(
-                wrappedFunction,
-                callableMetadata.get(
-                  this[methodName as keyof this] as Function
-                )!
-              );
-            }
-
-            // set the wrapped function on the prototype
-            this.constructor.prototype[methodName as keyof this] =
-              wrappedFunction;
-          }
+        // if the method is callable, copy the metadata from the original method
+        if (this._isCallable(methodName)) {
+          callableMetadata.set(
+            wrappedFunction,
+            callableMetadata.get(this[methodName as keyof this] as Function)!
+          );
         }
+
+        // set the wrapped function on the prototype
+        this.constructor.prototype[methodName as keyof this] = wrappedFunction;
       }
 
       proto = Object.getPrototypeOf(proto);
@@ -1375,8 +1411,9 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
   /**
    * Connect to a new MCP Server
    *
+   * @param serverName Name of the MCP server
    * @param url MCP Server SSE URL
-   * @param callbackHost Base host for the agent, used for the redirect URI.
+   * @param callbackHost Base host for the agent, used for the redirect URI. If not provided, will be derived from the current request.
    * @param agentsPrefix agents routing prefix if not using `agents`
    * @param options MCP client and transport (header) options
    * @returns authUrl
@@ -1384,7 +1421,7 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
   async addMcpServer(
     serverName: string,
     url: string,
-    callbackHost: string,
+    callbackHost?: string,
     agentsPrefix = "agents",
     options?: {
       client?: ConstructorParameters<typeof Client>[1];
@@ -1393,7 +1430,22 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
       };
     }
   ): Promise<{ id: string; authUrl: string | undefined }> {
-    const callbackUrl = `${callbackHost}/${agentsPrefix}/${camelCaseToKebabCase(this._ParentClass.name)}/${this.name}/callback`;
+    // If callbackHost is not provided, derive it from the current request
+    let resolvedCallbackHost = callbackHost;
+    if (!resolvedCallbackHost) {
+      const { request } = getCurrentAgent();
+      if (!request) {
+        throw new Error(
+          "callbackHost is required when not called within a request context"
+        );
+      }
+
+      // Extract the origin from the request
+      const requestUrl = new URL(request.url);
+      resolvedCallbackHost = `${requestUrl.protocol}//${requestUrl.host}`;
+    }
+
+    const callbackUrl = `${resolvedCallbackHost}/${agentsPrefix}/${camelCaseToKebabCase(this._ParentClass.name)}/${this.name}/callback`;
 
     const result = await this._connectToMcpServerInternal(
       serverName,
@@ -1441,6 +1493,7 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
        */
       transport?: {
         headers?: HeadersInit;
+        type?: TransportType;
       };
     },
     reconnect?: {
@@ -1483,12 +1536,16 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
       };
     }
 
+    // Use the transport type specified in options, or default to "auto"
+    const transportType = options?.transport?.type || "auto";
+
     const { id, authUrl, clientId } = await this.mcp.connect(url, {
       client: options?.client,
       reconnect,
       transport: {
         ...headerTransportOpts,
-        authProvider
+        authProvider,
+        type: transportType
       }
     });
 
@@ -1501,6 +1558,7 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
 
   async removeMcpServer(id: string) {
     this.mcp.closeConnection(id);
+    this.mcp.unregisterCallbackUrl(id);
     this.sql`
       DELETE FROM cf_agents_mcp_servers WHERE id = ${id};
     `;
@@ -1542,6 +1600,9 @@ export class Agent<Env = typeof env, State = unknown> extends Server<Env> {
     return mcpState;
   }
 }
+
+// A set of classes that have been wrapped with agent context
+const wrappedClasses = new Set<typeof Agent.prototype.constructor>();
 
 /**
  * Namespace for creating Agent instances
@@ -1858,12 +1919,17 @@ export type EmailSendOptions = {
  * @param options Options for Agent creation
  * @returns Promise resolving to an Agent instance stub
  */
-export async function getAgentByName<Env, T extends Agent<Env>>(
+export async function getAgentByName<
+  Env,
+  T extends Agent<Env>,
+  Props extends Record<string, unknown> = Record<string, unknown>
+>(
   namespace: AgentNamespace<T>,
   name: string,
   options?: {
     jurisdiction?: DurableObjectJurisdiction;
     locationHint?: DurableObjectLocationHint;
+    props?: Props;
   }
 ) {
   return getServerByName<Env, T>(namespace, name, options);

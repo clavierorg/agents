@@ -2,12 +2,19 @@ import { openai } from "@ai-sdk/openai";
 import { routeAgentRequest } from "agents";
 import { AIChatAgent } from "agents/ai-chat-agent";
 import {
+  convertToModelMessages,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
   type StreamTextOnFinishCallback,
-  createDataStreamResponse,
-  streamText
+  streamText,
+  stepCountIs
 } from "ai";
 import { tools } from "./tools";
-import { processToolCalls } from "./utils";
+import {
+  processToolCalls,
+  hasToolConfirmation,
+  getWeatherInformation
+} from "./utils";
 
 type Env = {
   OPENAI_API_KEY: string;
@@ -15,39 +22,50 @@ type Env = {
 
 export class HumanInTheLoop extends AIChatAgent<Env> {
   async onChatMessage(onFinish: StreamTextOnFinishCallback<{}>) {
-    const dataStreamResponse = createDataStreamResponse({
-      execute: async (dataStream) => {
-        // Utility function to handle tools that require human confirmation
-        // Checks for confirmation in last message and then runs associated tool
-        const processedMessages = await processToolCalls(
-          {
-            dataStream,
-            messages: this.messages,
-            tools
-          },
-          {
-            // type-safe object for tools without an execute function
-            getWeatherInformation: async ({ city }) => {
-              const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-              return `The weather in ${city} is ${
-                conditions[Math.floor(Math.random() * conditions.length)]
-              }.`;
-            }
-          }
-        );
+    const startTime = Date.now();
 
-        const result = streamText({
-          messages: processedMessages,
-          model: openai("gpt-4o"),
-          onFinish,
-          tools
-        });
+    const lastMessage = this.messages[this.messages.length - 1];
 
-        result.mergeIntoDataStream(dataStream);
-      }
+    if (hasToolConfirmation(lastMessage)) {
+      // Process tool confirmations using UI stream
+      const stream = createUIMessageStream({
+        execute: async ({ writer }) => {
+          await processToolCalls(
+            { writer, messages: this.messages, tools },
+            { getWeatherInformation }
+          );
+        }
+      });
+      return createUIMessageStreamResponse({ stream });
+    }
+
+    // Use streamText directly and return with metadata
+    const result = streamText({
+      messages: convertToModelMessages(this.messages),
+      model: openai("gpt-4o"),
+      onFinish,
+      tools,
+      stopWhen: stepCountIs(5)
     });
 
-    return dataStreamResponse;
+    return result.toUIMessageStreamResponse({
+      messageMetadata: ({ part }) => {
+        // This is optional, purely for demo purposes in this example
+        if (part.type === "start") {
+          return {
+            model: "gpt-4o",
+            createdAt: Date.now(),
+            messageCount: this.messages.length
+          };
+        }
+        if (part.type === "finish") {
+          return {
+            responseTime: Date.now() - startTime,
+            totalTokens: part.totalUsage?.totalTokens
+          };
+        }
+      }
+    });
   }
 }
 

@@ -1,9 +1,8 @@
 import type {
-  Message as ChatMessage,
+  UIMessage as ChatMessage,
   StreamTextOnFinishCallback,
   ToolSet
 } from "ai";
-import { appendResponseMessages } from "ai";
 import { Agent, type AgentContext, type Connection, type WSMessage } from "./";
 import {
   MessageType,
@@ -98,13 +97,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
 
         return this._tryCatchChat(async () => {
           const response = await this.onChatMessage(
-            async ({ response }) => {
-              const finalMessages = appendResponseMessages({
-                messages,
-                responseMessages: response.messages
-              });
-
-              await this.persistMessages(finalMessages, [connection.id]);
+            async (_finishResult) => {
               this._removeAbortController(chatMessageId);
 
               this.observability?.emit(
@@ -117,6 +110,9 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
                 },
                 this.ctx
               );
+
+              // Note: Message persistence now happens in the _reply method
+              // after the complete response text has been accumulated
             },
             abortSignal ? { abortSignal } : undefined
           );
@@ -224,27 +220,11 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
   }
 
   /**
-   * Save messages on the server side and trigger AI response
-   * @param incomingMessages Chat messages to save
+   * Save messages on the server side
+   * @param messages Chat messages to save
    */
   async saveMessages(incomingMessages: ChatMessage[]) {
     await this.persistMessages(incomingMessages);
-    const messages = this.getMergedMessages(incomingMessages);
-    const response = await this.onChatMessage(async ({ response }) => {
-      const finalMessages = appendResponseMessages({
-        messages,
-        responseMessages: response.messages
-      });
-      await this.persistMessages(finalMessages, []);
-    });
-    if (response) {
-      // we're just going to drain the body
-      // @ts-ignore TODO: fix this type error
-      for await (const chunk of response.body!) {
-        decoder.decode(chunk);
-      }
-      response.body?.cancel();
-    }
   }
 
   async persistMessages(
@@ -269,26 +249,175 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
   }
 
   private async _reply(id: string, response: Response) {
-    // now take chunks out from dataStreamResponse and send them to the client
     return this._tryCatchChat(async () => {
-      // @ts-expect-error TODO: fix this type error
-      for await (const chunk of response.body!) {
-        const body = decoder.decode(chunk);
-
+      if (!response.body) {
+        // Send empty response if no body
         this._broadcastChatMessage({
-          body,
-          done: false,
+          body: "",
+          done: true,
           id,
           type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
         });
+        return;
       }
 
-      this._broadcastChatMessage({
-        body: "",
-        done: true,
-        id,
-        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+      const reader = response.body.getReader();
+      let fullResponseText = ""; // Accumulate the assistant's response text
+      let fullReasoningText = ""; // Accumulate the assistant's reasoning
+      // Track tool calls by toolCallid, so we can persist them as parts later
+      const toolCalls = new Map<
+        string,
+        {
+          type: string;
+          state: string;
+          toolCallId: string;
+          toolName: string;
+          input?: unknown;
+          output?: unknown;
+          isError?: boolean;
+          errorText?: string;
+        }
+      >();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            // Send final completion signal
+            this._broadcastChatMessage({
+              body: "",
+              done: true,
+              id,
+              type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+            });
+            break;
+          }
+
+          const chunk = decoder.decode(value);
+
+          // Determine response format based on content-type
+          const contentType = response.headers.get("content-type") || "";
+          const isSSE = contentType.includes("text/event-stream");
+
+          if (isSSE) {
+            // Parse AI SDK v5 SSE format and extract text deltas
+            const lines = chunk.split("\n");
+            for (const line of lines) {
+              if (line.startsWith("data: ") && line !== "data: [DONE]") {
+                try {
+                  const data = JSON.parse(line.slice(6)); // Remove 'data: ' prefix
+
+                  switch (data.type) {
+                    // SSE event signaling the tool input is ready. We track by
+                    // `toolCallId` so we can persist it as a tool part in the message.
+                    case "tool-input-available": {
+                      const { toolCallId, toolName, input } = data;
+                      toolCalls.set(toolCallId, {
+                        toolCallId,
+                        toolName,
+                        input,
+                        type: toolName ? `tool-${toolName}` : "dynamic-tool",
+                        state: "input-available"
+                      });
+                      break;
+                    }
+
+                    // SSE event signaling the tool output is ready. We should've
+                    // already received the input in a previous event so an entry
+                    // with `toolCallId` should already be present
+                    case "tool-output-available": {
+                      const { toolCallId, output, isError, errorText } = data;
+                      const toolPart = toolCalls.get(toolCallId);
+                      if (toolPart)
+                        toolCalls.set(toolCallId, {
+                          ...toolPart,
+                          output,
+                          isError,
+                          errorText,
+                          state: "output-available"
+                        });
+                      break;
+                    }
+
+                    case "error": {
+                      // Non-tool errors, we set `error: true` and terminate early
+                      this._broadcastChatMessage({
+                        error: true,
+                        body: data.errorText ?? JSON.stringify(data),
+                        done: false,
+                        id,
+                        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+                      });
+                      return;
+                    }
+
+                    case "reasoning-delta": {
+                      if (data.delta) fullReasoningText += data.delta;
+                      break;
+                    }
+
+                    case "text-delta": {
+                      if (data.delta) fullResponseText += data.delta;
+                      break;
+                    }
+                  }
+
+                  // Always forward the raw part to the client
+                  this._broadcastChatMessage({
+                    body: JSON.stringify(data),
+                    done: false,
+                    id,
+                    type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+                  });
+                } catch (_e) {
+                  // Skip malformed JSON lines silently
+                }
+              }
+            }
+          } else {
+            // Handle plain text responses (e.g., from generateText)
+            // Treat the entire chunk as a text delta to preserve exact formatting
+            if (chunk.length > 0) {
+              fullResponseText += chunk;
+              // Synthesize a text-delta event so clients can stream-render
+              this._broadcastChatMessage({
+                body: JSON.stringify({ type: "text-delta", delta: chunk }),
+                done: false,
+                id,
+                type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+              });
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      // After streaming is complete, persist the complete assistant's response
+      const messageParts: ChatMessage["parts"] = [];
+
+      Array.from(toolCalls.values()).forEach((t) => {
+        messageParts.push(t as ChatMessage["parts"][number]);
       });
+
+      if (fullReasoningText.trim()) {
+        messageParts.push({ type: "reasoning", text: fullReasoningText });
+      }
+
+      if (fullResponseText.trim()) {
+        messageParts.push({ type: "text", text: fullResponseText });
+      }
+
+      if (messageParts.length > 0) {
+        await this.persistMessages(
+          this.getMergedMessages([
+            {
+              id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+              role: "assistant",
+              parts: messageParts
+            }
+          ])
+        );
+      }
     });
   }
 
