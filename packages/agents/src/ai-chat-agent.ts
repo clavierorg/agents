@@ -408,15 +408,13 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       }
 
       if (messageParts.length > 0) {
-        await this.persistMessages(
-          this.getMergedMessages([
-            {
-              id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-              role: "assistant",
-              parts: messageParts
-            }
-          ])
-        );
+        await this.persistMessages([
+          {
+            id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+            role: "assistant",
+            parts: messageParts
+          }
+        ]);
       }
     });
   }
