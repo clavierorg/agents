@@ -79,15 +79,37 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
           // dispatcher,
           // duplex
         } = data.init;
-        const { messages: incomingMessages } = JSON.parse(body as string);
+        const bodyParsed = JSON.parse(body as string);
+
+        // Clean up incomplete tool calls to prevent API errors
+        const incomingMessages = bodyParsed.messages.filter(
+          (message: ChatMessage) => {
+            return message.parts.map((part) => {
+              if (isToolUIPart(part)) {
+                if (
+                  part.state === "input-streaming" ||
+                  part.state === "input-available"
+                ) {
+                  // Client did not give return an output, so we'll mark it as an error (reminder: inputs always call from models, not clients)
+                  Object.assign(part, {
+                    state: "output-error",
+                    errorText: "Incomplete tool call"
+                  });
+                }
+              }
+              return part;
+            });
+          }
+        );
+
         await this.persistMessages(incomingMessages);
 
         this._broadcastChatMessage(
           {
             messages: incomingMessages,
             type: MessageType.CF_AGENT_CHAT_MESSAGES
-          },
-          { exclude: [connection.id] } // fan out client message
+          }
+          // do not exclude the client since we've applied transformations to the messages (cleaning up incomplete tool calls)
         );
 
         this.observability?.emit(
