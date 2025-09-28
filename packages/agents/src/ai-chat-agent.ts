@@ -218,6 +218,11 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
     this.messages = [];
   }
 
+  async deleteMessage(id: string) {
+    this.sql`delete from cf_ai_chat_agent_messages where id = ${id}`;
+    this.messages = this.messages.filter((message) => message.id !== id);
+  }
+
   async persistMessages(incomingMessages: ChatMessage[]) {
     // upsert messages in the database
     for (const msg of incomingMessages) {
@@ -266,6 +271,7 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
         role: "assistant",
         parts: []
       };
+      let error = false;
       let activeTextParts: Record<string, TextUIPart> = {};
       let activeReasoningParts: Record<string, ReasoningUIPart> = {};
       const partialToolCalls: Record<
@@ -474,7 +480,6 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
               if (line.startsWith("data: ") && line !== "data: [DONE]") {
                 try {
                   const data: UIMessageChunk = JSON.parse(line.slice(6)); // Remove 'data: ' prefix
-                  let error = false;
                   switch (data.type) {
                     case "text-start": {
                       const textPart: TextUIPart = {
@@ -844,8 +849,12 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
         reader.releaseLock();
       }
 
-      if (message.parts.length > 0) {
-        await this.persistMessages([message]);
+      if (error) {
+        await this.deleteMessage(id); // delete the faulty request
+      } else {
+        if (message.parts.length > 0) {
+          await this.persistMessages([message]); // persist the response
+        }
       }
     });
   }
